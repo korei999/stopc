@@ -1,15 +1,16 @@
-#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <threads.h>
 #include <unistd.h>
 
 int Quit = 0;
 int Paused = 0;
-pthread_cond_t Pause_cv;
-pthread_mutex_t Pause_ml;
+
+cnd_t Pause_cnd;
+mtx_t Pause_mtx;
 
 void
 raw(void)
@@ -24,7 +25,8 @@ void
 fix_cursor_and_quit(int signum)
 {
     printf("\e[?25h"); /* unhide cursor */
-    Quit = 1;
+    mtx_destroy(&Pause_mtx);
+    cnd_destroy(&Pause_cnd);
     exit(0);
 }
 
@@ -47,7 +49,7 @@ input(void)
             case ' ':
                 Paused = !Paused;
                 if (!Paused)
-                    pthread_cond_signal(&Pause_cv);
+                    cnd_signal(&Pause_cnd);
                 break;
 
             default:
@@ -56,24 +58,39 @@ input(void)
     }
 }
 
-enum arg {
-    MILLISECONDS = 0,
-    SECONDS = 1
+void
+wait_on_paused()
+{
+    if (Paused) {
+        mtx_lock(&Pause_mtx);
+        cnd_wait(&Pause_cnd, &Pause_mtx);
+        mtx_unlock(&Pause_mtx);
+    }
+}
+
+enum {
+    milliseconds = 0,
+    seconds = 1,
+    sleep_1ms = 1000,
+    sleep_1s = 1000000
 };
 
 int
 main(int argc, char* argv[])
 {
-    pthread_t input_thread;
+    thrd_t input_thread;
+
     int ms_or_s;
     if (argc > 1 && strncmp(argv[1], "1", 1) == 0)
-            ms_or_s = SECONDS;
+            ms_or_s = seconds;
     else
-        ms_or_s = MILLISECONDS;
+        ms_or_s = milliseconds;
 
     raw();
-    pthread_create(&input_thread, NULL, (void*)input, NULL);
-    pthread_cond_init(&Pause_cv, NULL);
+    thrd_create(&input_thread, (thrd_start_t)input, NULL);
+    thrd_detach(input_thread);
+    cnd_init(&Pause_cnd);
+    mtx_init(&Pause_mtx, mtx_plain);
 
     for (int h = 0; ; h++) {
 
@@ -81,38 +98,20 @@ main(int argc, char* argv[])
 
             for (int s = 0; s < 60; s++) {
                 /****************************/
-                if (ms_or_s == MILLISECONDS) {
+                if (ms_or_s == milliseconds) {
                     for (int ms = 0; ms < 1000; ms++) {
-                        if (Quit) {
-                            pthread_cancel(input_thread);
-                            goto exit;
-                        }
-
-                        if (Paused) {
-                            pthread_mutex_lock(&Pause_ml);
-                            pthread_cond_wait(&Pause_cv, &Pause_ml);
-                            pthread_mutex_unlock(&Pause_ml);
-                        }
-
                         printf("%d:%0*d:%0*d.%0*d\r", h, 2, m, 2, s, 3, ms);
                         fflush(stdout);
-                        usleep(1000);
+                        usleep(sleep_1ms);
+
+                        wait_on_paused();
                     }
                 } else {
-                    if (Quit) {
-                        pthread_cancel(input_thread);
-                        goto exit;
-                    }
-
-                    if (Paused) {
-                        pthread_mutex_lock(&Pause_ml);
-                        pthread_cond_wait(&Pause_cv, &Pause_ml);
-                        pthread_mutex_unlock(&Pause_ml);
-                    }
-
                     printf("%0*d:%0*d:%0*d\r", 2, h, 2, m, 2, s);
                     fflush(stdout);
-                    usleep(1000000);
+                    usleep(sleep_1s);
+
+                    wait_on_paused();
                 }
                 /****************************/
             }
@@ -120,6 +119,5 @@ main(int argc, char* argv[])
         }
     }
 
-exit:
-    pthread_join(input_thread, NULL);
+    return 0;
 }
